@@ -1,7 +1,11 @@
 """DXNN Converter — FastAPI web service.
 
 Upload a .pt YOLO model, convert it to .dxnn for DEEPX DX-M1 NPU.
-Pipeline: .pt → yolo.export(format="deepx") → .dxnn
+Pipeline: .pt → yolo.export(format="deepx", data=...) → .dxnn
+
+Calibration dataset is NOT uploaded. Put it under YOLO_HOST_PATH (.env),
+which is mounted at /app/yolo, then pass a path relative to that mount
+(e.g. data.yaml or my_fruit/data.yaml).
 """
 import importlib
 import json
@@ -11,13 +15,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 # ---- Paths ----
 BASE_DIR = Path(__file__).parent
 WORK_DIR = BASE_DIR / "work"
 WORK_DIR.mkdir(exist_ok=True)
+# Docker: ${YOLO_HOST_PATH}:/app/yolo — host datasets live here
+YOLO_DIR = Path("/app/yolo")
 
 
 def _dx_com_available() -> bool:
@@ -69,6 +75,7 @@ def _public_task(t: dict[str, Any]) -> dict[str, Any]:
         "step": t.get("step", ""),
         "message": t.get("message", ""),
         "model_name": t.get("model_name"),
+        "data_path": t.get("data_path"),
         "dxnn_name": t.get("dxnn_name") or (Path(dxnn_path).name if dxnn_path else None),
         "error": t.get("error"),
         "created_at": t.get("created_at"),
@@ -92,6 +99,47 @@ def _prune_work(task_dir: Path, keep: Path):
             pass
 
 
+def _resolve_data_path(raw: str | None) -> Path:
+    """Resolve calibration dataset path under /app/yolo (Docker mount).
+
+    Accepts paths relative to YOLO_DIR (preferred), or absolute paths that
+    stay inside YOLO_DIR. Empty input raises ValueError (path is required).
+    """
+    if raw is None or not str(raw).strip():
+        raise ValueError(
+            "请填写校准数据集路径（相对 /app/yolo，例如 data.yaml），不可留空。"
+        )
+    text = str(raw).strip().replace("\\", "/")
+
+    yolo = YOLO_DIR.resolve()
+    p = Path(text)
+    if p.is_absolute():
+        resolved = p.resolve()
+    else:
+        # strip leading ./ or /app/yolo/ if user pastes container path prefix
+        for prefix in ("/app/yolo/", "app/yolo/"):
+            if text.startswith(prefix):
+                text = text[len(prefix) :]
+                break
+        resolved = (yolo / text).resolve()
+
+    try:
+        resolved.relative_to(yolo)
+    except ValueError as e:
+        raise ValueError(
+            f"校准数据路径必须位于映射目录内（容器 /app/yolo，对应 .env 的 YOLO_HOST_PATH）: {raw}"
+        ) from e
+
+    if not resolved.exists():
+        raise ValueError(
+            f"校准数据不存在: {resolved}（请把数据集放到 YOLO_HOST_PATH 下，"
+            f"网页填写相对路径，例如 data.yaml）"
+        )
+    if resolved.is_file() and resolved.suffix.lower() not in {".yaml", ".yml"}:
+        raise ValueError(f"校准数据应为 .yaml/.yml 数据集配置文件: {resolved.name}")
+    return resolved
+
+
 # ---- FastAPI ----
 app = FastAPI(title="DXNN Converter")
 
@@ -104,9 +152,12 @@ async def index():
 @app.get("/api/status")
 async def api_status():
     available = _dx_com_available()
+    yolo_ok = YOLO_DIR.is_dir()
     return {
         "dx_com_available": available,
         "dx_com_path": "python-package" if available else None,
+        "yolo_dir": str(YOLO_DIR),
+        "yolo_mounted": yolo_ok,
         "tasks": len(tasks),
     }
 
@@ -119,8 +170,16 @@ async def api_history():
 
 
 @app.post("/api/convert")
-async def api_convert(model_file: UploadFile = File(...)):
-    """Upload a .pt model and start conversion. Returns task_id."""
+async def api_convert(
+    model_file: UploadFile = File(...),
+    data_path: str = Form(""),
+):
+    """Upload a .pt model and start conversion. Returns task_id.
+
+    data_path: required path under /app/yolo (YOLO_HOST_PATH), e.g. ``data.yaml``.
+    Not uploaded — dataset must already exist on the mounted host folder.
+    Empty path is rejected (no default coco8).
+    """
     if not model_file.filename.endswith(".pt"):
         return JSONResponse(
             status_code=400, content={"error": "只支持 .pt 文件"}
@@ -134,6 +193,20 @@ async def api_convert(model_file: UploadFile = File(...)):
             },
         )
 
+    if not str(data_path or "").strip():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "请填写校准数据集路径（相对 /app/yolo，例如 data.yaml）。"
+                "数据集需放在 .env 的 YOLO_HOST_PATH 映射目录下，不可留空。",
+            },
+        )
+
+    try:
+        resolved_data = _resolve_data_path(data_path)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
     task_id = uuid.uuid4().hex[:12]
     task_dir = _task_dir(task_id)
 
@@ -142,6 +215,11 @@ async def api_convert(model_file: UploadFile = File(...)):
         content = await model_file.read()
         f.write(content)
 
+    try:
+        data_display = str(resolved_data.relative_to(YOLO_DIR.resolve()))
+    except ValueError:
+        data_display = str(resolved_data)
+
     tasks[task_id] = {
         "id": task_id,
         "status": "pending",
@@ -149,6 +227,7 @@ async def api_convert(model_file: UploadFile = File(...)):
         "step": "upload",
         "message": "已上传，等待转换",
         "model_name": model_file.filename,
+        "data_path": data_display,
         "input_size": 640,
         "dxnn_path": None,
         "dxnn_name": None,
@@ -161,15 +240,20 @@ async def api_convert(model_file: UploadFile = File(...)):
     import threading
     thread = threading.Thread(
         target=_run_conversion,
-        args=(task_id, task_dir, model_path),
+        args=(task_id, task_dir, model_path, resolved_data),
         daemon=True,
     )
     thread.start()
 
-    return {"task_id": task_id}
+    return {"task_id": task_id, "data_path": data_display}
 
 
-def _run_conversion(task_id: str, task_dir: Path, model_path: Path):
+def _run_conversion(
+    task_id: str,
+    task_dir: Path,
+    model_path: Path,
+    data_path: Path | None = None,
+):
     """Run the official Ultralytics DEEPX export pipeline.
 
     Uses ``yolo.export(format="deepx")`` which internally:
@@ -192,14 +276,22 @@ def _run_conversion(task_id: str, task_dir: Path, model_path: Path):
 
         model = YOLO(str(model_path))
 
-        _update_task(task_id, progress=20,
-                     message="调用 yolo.export(format='deepx')，包含 ONNX 导出 + DX-COM 编译...")
+        if data_path is None:
+            raise ValueError("校准数据集路径不能为空")
 
-        export_path = model.export(
-            format="deepx",
-            imgsz=input_size,
-            simplify=True,
+        export_kwargs: dict[str, Any] = {
+            "format": "deepx",
+            "imgsz": input_size,
+            "simplify": True,
+            "data": str(data_path),
+        }
+        _update_task(
+            task_id,
+            progress=20,
+            message=f"调用 yolo.export(format='deepx', data={data_path}) ...",
         )
+
+        export_path = model.export(**export_kwargs)
         export_path = Path(export_path)
         if not export_path.exists():
             raise RuntimeError(f"DEEPX 导出失败: {export_path}")
@@ -302,6 +394,8 @@ h2 { font-size: 16px; margin-bottom: 16px; }
 label { display: block; font-weight: 600; margin-bottom: 8px; font-size: 14px; }
 input[type="file"] { width: 100%; padding: 10px; border: 2px dashed #ddd;
                      border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+input[type="text"] { width: 100%; padding: 10px 12px; border: 1px solid #ddd;
+                     border-radius: 8px; margin-bottom: 8px; font-size: 14px; }
 .hint { color: #999; font-size: 12px; margin-bottom: 16px; }
 button { width: 100%; padding: 14px; background: #4f46e5; color: #fff;
          border: none; border-radius: 8px; font-size: 16px; font-weight: 600;
@@ -352,6 +446,14 @@ button:disabled { background: #aaa; cursor: not-allowed; }
     <label>选择 .pt 模型文件</label>
     <input type="file" id="modelFile" accept=".pt" />
     <div class="hint">YOLOv8 / YOLO11 / YOLOv5 等 ultralytics 支持的模型</div>
+
+    <label>校准数据集路径（相对 /app/yolo，必填）</label>
+    <input type="text" id="dataPath" placeholder="例如 data.yaml 或 fruit/data.yaml" required />
+    <div class="hint" id="dataHint">
+      不上传数据集。把数据放到 .env 的 YOLO_HOST_PATH 目录下，这里填相对路径。
+      不可留空；路径必须在映射目录内且文件存在，否则直接报错。
+    </div>
+
     <button id="convertBtn" onclick="startConvert()">开始转换</button>
   </div>
 
@@ -410,11 +512,22 @@ async function checkStatus() {
   try {
     const res = await fetch('/api/status');
     const data = await res.json();
+    const w = document.getElementById('warning');
+    const hints = [];
     if (!data.dx_com_available) {
-      const w = document.getElementById('warning');
-      w.style.display = 'block';
-      w.textContent = '未检测到 dx_com Python 包。请重新构建镜像：docker compose up --build';
+      hints.push('未检测到 dx_com Python 包。请重新构建镜像：docker compose up --build');
       document.getElementById('convertBtn').disabled = true;
+    }
+    if (!data.yolo_mounted) {
+      hints.push('未挂载 /app/yolo。请在 .env 配置 YOLO_HOST_PATH 后 docker compose up -d');
+    } else {
+      document.getElementById('dataHint').textContent =
+        '数据集放在宿主机 YOLO_HOST_PATH 下，对应容器 ' + data.yolo_dir +
+        '。填写相对路径，例如 data.yaml。必填，不可留空；路径须在映射目录内且存在。';
+    }
+    if (hints.length) {
+      w.style.display = 'block';
+      w.textContent = hints.join(' ');
     }
   } catch(e) {}
 }
@@ -449,12 +562,18 @@ function setBusy(busy, text) {
 async function startConvert() {
   const modelFile = document.getElementById('modelFile').files[0];
   if (!modelFile) { alert('请选择 .pt 模型文件'); return; }
+  const dataPath = (document.getElementById('dataPath').value || '').trim();
+  if (!dataPath) {
+    alert('请填写校准数据集路径（相对 /app/yolo，例如 data.yaml）');
+    return;
+  }
 
   setBusy(true, '上传中...');
   showProgress({ status: 'pending', step: 'upload', progress: 2, message: '正在上传 ' + modelFile.name });
 
   const formData = new FormData();
   formData.append('model_file', modelFile);
+  formData.append('data_path', dataPath);
 
   try {
     const res = await fetch('/api/convert', { method: 'POST', body: formData });
@@ -512,6 +631,9 @@ async function loadHistory() {
       const outName = item.dxnn_name || String(item.model_name || '').replace(/\\.pt$/i, '.dxnn');
       const err = item.status === 'failed' && item.error
         ? ' · ' + escapeHtml(String(item.error).split('\\n')[0]) : '';
+      const calib = item.data_path
+        ? ' · 校准: ' + escapeHtml(item.data_path)
+        : ' · 校准: 默认';
       const dl = item.can_download
         ? `<a class="dl" href="/api/download/${item.id}">下载</a>`
         : `<span class="dl disabled">不可下载</span>`;
@@ -520,7 +642,7 @@ async function loadHistory() {
           <div class="history-name">${escapeHtml(item.model_name)} → ${escapeHtml(outName)}
             <span class="badge ${item.status}">${statusLabel(item.status)}</span>
           </div>
-          <div class="history-sub">${fmtTime(item.created_at)}${err}</div>
+          <div class="history-sub">${fmtTime(item.created_at)}${calib}${err}</div>
         </div>
         ${dl}
       </div>`;
