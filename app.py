@@ -140,6 +140,161 @@ def _resolve_data_path(raw: str | None) -> Path:
     return resolved
 
 
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def _load_yaml_file(path: Path) -> dict[str, Any]:
+    try:
+        from ultralytics.utils import YAML
+
+        data = YAML.load(path)
+    except Exception:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"无效的 YAML 内容: {path.name}")
+    return data
+
+
+def _dataset_root_from_yaml(yaml_path: Path, data: dict[str, Any]) -> Path:
+    """Resolve dataset root: prefer path relative to the yaml file directory."""
+    raw = data.get("path")
+    if not raw:
+        return yaml_path.parent.resolve()
+    p = Path(str(raw))
+    if p.is_absolute():
+        return p.resolve()
+    # User datasets almost always mean relative to the yaml location
+    return (yaml_path.parent / p).resolve()
+
+
+def _count_images(dir_path: Path) -> int:
+    if not dir_path.is_dir():
+        return 0
+    n = 0
+    for p in dir_path.rglob("*"):
+        if p.is_file() and p.suffix.lower() in _IMG_EXTS:
+            n += 1
+    return n
+
+
+def _split_path(root: Path, value: Any) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    out: list[Path] = []
+    for item in items:
+        p = Path(str(item))
+        out.append(p.resolve() if p.is_absolute() else (root / p).resolve())
+    return out
+
+
+def _validate_data_yaml(yaml_path: Path) -> dict[str, Any]:
+    """Check data.yaml exists and configured path/train/val directories are present."""
+    data = _load_yaml_file(yaml_path)
+    if "val" not in data and "validation" in data:
+        data["val"] = data["validation"]
+
+    missing_keys = [k for k in ("train", "val") if k not in data or data.get(k) in (None, "")]
+    if missing_keys:
+        raise ValueError(
+            f"{yaml_path.name} 缺少必要字段: {', '.join(missing_keys)}（需要 train 与 val）"
+        )
+    if data.get("names") is None and "nc" not in data:
+        raise ValueError(f"{yaml_path.name} 缺少 names 或 nc")
+
+    root = _dataset_root_from_yaml(yaml_path, data)
+    if not root.exists():
+        raise ValueError(
+            f"{yaml_path.name} 中 path 不存在: {data.get('path')!r} → {root}"
+        )
+    if not root.is_dir():
+        raise ValueError(f"{yaml_path.name} 中 path 不是目录: {root}")
+
+    splits: dict[str, Any] = {}
+    errors: list[str] = []
+    for key in ("train", "val", "test"):
+        if key not in data or data.get(key) in (None, ""):
+            continue
+        paths = _split_path(root, data[key])
+        for sp in paths:
+            exists = sp.exists()
+            images = _count_images(sp) if exists and sp.is_dir() else 0
+            if exists and sp.is_file() and sp.suffix.lower() in _IMG_EXTS:
+                images = 1
+            entry = {
+                "configured": str(data[key]),
+                "resolved": str(sp),
+                "exists": exists,
+                "images": images,
+            }
+            splits.setdefault(key, [])
+            if isinstance(splits[key], list):
+                splits[key].append(entry)
+            if not exists:
+                errors.append(f"{key} 路径不存在: {data[key]!r} → {sp}")
+            elif sp.is_dir() and images < 1 and key == "val":
+                errors.append(f"val 目录下没有图片: {sp}")
+
+    # Flatten single-path splits for simpler API/UI
+    flat_splits = {
+        k: (v[0] if isinstance(v, list) and len(v) == 1 else v) for k, v in splits.items()
+    }
+
+    if errors:
+        raise ValueError("；".join(errors))
+
+    val_info = flat_splits.get("val")
+    val_images = 0
+    if isinstance(val_info, dict):
+        val_images = int(val_info.get("images") or 0)
+    elif isinstance(val_info, list):
+        val_images = sum(int(x.get("images") or 0) for x in val_info)
+
+    return {
+        "root": str(root),
+        "root_configured": data.get("path"),
+        "splits": flat_splits,
+        "val_images": val_images,
+        "names": data.get("names"),
+        "nc": data.get("nc") if data.get("nc") is not None else (
+            len(data["names"]) if isinstance(data.get("names"), (list, dict)) else None
+        ),
+    }
+
+
+def _materialize_data_yaml(yaml_path: Path, dest: Path) -> Path:
+    """Write a copy of data.yaml with absolute path/train/val for reliable export."""
+    data = _load_yaml_file(yaml_path)
+    if "val" not in data and "validation" in data:
+        data["val"] = data.pop("validation")
+    root = _dataset_root_from_yaml(yaml_path, data)
+    data["path"] = str(root)
+    for key in ("train", "val", "test", "minival"):
+        if key not in data or data.get(key) in (None, ""):
+            continue
+        paths = _split_path(root, data[key])
+        data[key] = str(paths[0]) if len(paths) == 1 else [str(p) for p in paths]
+
+    # Prefer ultralytics YAML saver when available; fallback to PyYAML
+    try:
+        from ultralytics.utils import YAML
+
+        YAML.save(dest, data)
+    except Exception:
+        import yaml  # type: ignore
+
+        dest.write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+    return dest
+
+
 # ---- FastAPI ----
 app = FastAPI(title="DXNN Converter")
 
@@ -167,6 +322,54 @@ async def api_history():
     items = [_public_task(t) for t in tasks.values()]
     items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
     return {"items": items}
+
+
+@app.get("/api/check-data-path")
+async def api_check_data_path(path: str = ""):
+    """Validate calibration dataset yaml and the path/train/val it references."""
+    raw = (path or "").strip()
+    if not raw:
+        return {
+            "ok": False,
+            "exists": False,
+            "path": "",
+            "resolved": None,
+            "details": None,
+            "error": "请填写校准数据集路径（相对 /app/yolo，例如 data.yaml）",
+        }
+    if not YOLO_DIR.is_dir():
+        return {
+            "ok": False,
+            "exists": False,
+            "path": raw,
+            "resolved": None,
+            "details": None,
+            "error": "未挂载 /app/yolo，请检查 .env 的 YOLO_HOST_PATH",
+        }
+    try:
+        resolved = _resolve_data_path(raw)
+        details = _validate_data_yaml(resolved)
+        try:
+            display = str(resolved.relative_to(YOLO_DIR.resolve()))
+        except ValueError:
+            display = str(resolved)
+        return {
+            "ok": True,
+            "exists": True,
+            "path": raw,
+            "resolved": display,
+            "details": details,
+            "error": None,
+        }
+    except ValueError as e:
+        return {
+            "ok": False,
+            "exists": False,
+            "path": raw,
+            "resolved": None,
+            "details": None,
+            "error": str(e),
+        }
 
 
 @app.post("/api/convert")
@@ -204,6 +407,7 @@ async def api_convert(
 
     try:
         resolved_data = _resolve_data_path(data_path)
+        _validate_data_yaml(resolved_data)
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
@@ -279,16 +483,22 @@ def _run_conversion(
         if data_path is None:
             raise ValueError("校准数据集路径不能为空")
 
+        details = _validate_data_yaml(data_path)
+        export_data = _materialize_data_yaml(data_path, task_dir / "calib_data.yaml")
+
         export_kwargs: dict[str, Any] = {
             "format": "deepx",
             "imgsz": input_size,
             "simplify": True,
-            "data": str(data_path),
+            "data": str(export_data),
         }
         _update_task(
             task_id,
             progress=20,
-            message=f"调用 yolo.export(format='deepx', data={data_path}) ...",
+            message=(
+                f"调用 yolo.export(format='deepx', data={data_path}) "
+                f"[val 图片 {details.get('val_images', '?')} 张] ..."
+            ),
         )
 
         export_path = model.export(**export_kwargs)
@@ -397,6 +607,12 @@ input[type="file"] { width: 100%; padding: 10px; border: 2px dashed #ddd;
 input[type="text"] { width: 100%; padding: 10px 12px; border: 1px solid #ddd;
                      border-radius: 8px; margin-bottom: 8px; font-size: 14px; }
 .hint { color: #999; font-size: 12px; margin-bottom: 16px; }
+.path-status { font-size: 12px; margin: -8px 0 16px; min-height: 1.2em; }
+.path-status.ok { color: #059669; }
+.path-status.bad { color: #dc2626; }
+.path-status.checking { color: #888; }
+input[type="text"].path-bad { border-color: #fca5a5; }
+input[type="text"].path-ok { border-color: #6ee7b7; }
 button { width: 100%; padding: 14px; background: #4f46e5; color: #fff;
          border: none; border-radius: 8px; font-size: 16px; font-weight: 600;
          cursor: pointer; transition: background 0.2s; }
@@ -449,6 +665,7 @@ button:disabled { background: #aaa; cursor: not-allowed; }
 
     <label>校准数据集路径（相对 /app/yolo，必填）</label>
     <input type="text" id="dataPath" placeholder="例如 data.yaml 或 fruit/data.yaml" required />
+    <div id="dataPathStatus" class="path-status" aria-live="polite"></div>
     <div class="hint" id="dataHint">
       不上传数据集。把数据放到 .env 的 YOLO_HOST_PATH 目录下，这里填相对路径。
       不可留空；路径必须在映射目录内且文件存在，否则直接报错。
@@ -481,6 +698,9 @@ button:disabled { background: #aaa; cursor: not-allowed; }
 let currentTaskId = null;
 let pollTimer = null;
 let freshId = null;
+let dataPathOk = false;
+let dataPathCheckTimer = null;
+let dataPathCheckSeq = 0;
 
 const STEP_LABEL = {
   upload: '上传模型',
@@ -508,6 +728,64 @@ function statusLabel(s) {
   return { done: '已完成', failed: '失败', running: '转换中', pending: '等待中' }[s] || s;
 }
 
+function setDataPathStatus(kind, text) {
+  const el = document.getElementById('dataPathStatus');
+  const input = document.getElementById('dataPath');
+  el.className = 'path-status' + (kind ? ' ' + kind : '');
+  el.textContent = text || '';
+  input.classList.toggle('path-ok', kind === 'ok');
+  input.classList.toggle('path-bad', kind === 'bad');
+}
+
+async function checkDataPath(forceEmptyMsg) {
+  const raw = (document.getElementById('dataPath').value || '').trim();
+  const seq = ++dataPathCheckSeq;
+  if (!raw) {
+    dataPathOk = false;
+    if (forceEmptyMsg) {
+      setDataPathStatus('bad', '请填写校准数据集路径');
+    } else {
+      setDataPathStatus('', '');
+    }
+    return false;
+  }
+  setDataPathStatus('checking', '正在检查路径…');
+  try {
+    const res = await fetch('/api/check-data-path?path=' + encodeURIComponent(raw));
+    const data = await res.json();
+    if (seq !== dataPathCheckSeq) return dataPathOk;
+    if (data.ok) {
+      dataPathOk = true;
+      const d = data.details || {};
+      const val = d.splits && d.splits.val;
+      let extra = '';
+      if (val && !Array.isArray(val)) {
+        extra = ` · val: ${val.images} 张图`;
+      } else if (typeof d.val_images === 'number') {
+        extra = ` · val: ${d.val_images} 张图`;
+      }
+      if (d.root_configured != null) {
+        extra += ` · path: ${d.root_configured}`;
+      }
+      setDataPathStatus('ok', '配置有效：/app/yolo/' + data.resolved + extra);
+      return true;
+    }
+    dataPathOk = false;
+    setDataPathStatus('bad', data.error || '路径无效');
+    return false;
+  } catch (e) {
+    if (seq !== dataPathCheckSeq) return dataPathOk;
+    dataPathOk = false;
+    setDataPathStatus('bad', '路径检查失败: ' + e.message);
+    return false;
+  }
+}
+
+function scheduleCheckDataPath() {
+  if (dataPathCheckTimer) clearTimeout(dataPathCheckTimer);
+  dataPathCheckTimer = setTimeout(() => checkDataPath(false), 350);
+}
+
 async function checkStatus() {
   try {
     const res = await fetch('/api/status');
@@ -523,7 +801,7 @@ async function checkStatus() {
     } else {
       document.getElementById('dataHint').textContent =
         '数据集放在宿主机 YOLO_HOST_PATH 下，对应容器 ' + data.yolo_dir +
-        '。填写相对路径，例如 data.yaml。必填，不可留空；路径须在映射目录内且存在。';
+        '。填写相对路径，例如 data.yaml。输入后会自动检查是否存在。';
     }
     if (hints.length) {
       w.style.display = 'block';
@@ -564,7 +842,13 @@ async function startConvert() {
   if (!modelFile) { alert('请选择 .pt 模型文件'); return; }
   const dataPath = (document.getElementById('dataPath').value || '').trim();
   if (!dataPath) {
+    setDataPathStatus('bad', '请填写校准数据集路径');
     alert('请填写校准数据集路径（相对 /app/yolo，例如 data.yaml）');
+    return;
+  }
+  const ok = await checkDataPath(true);
+  if (!ok) {
+    alert(document.getElementById('dataPathStatus').textContent || '校准数据集路径无效');
     return;
   }
 
@@ -654,6 +938,11 @@ async function loadHistory() {
 
 checkStatus();
 loadHistory();
+
+const dataPathInput = document.getElementById('dataPath');
+dataPathInput.addEventListener('input', scheduleCheckDataPath);
+dataPathInput.addEventListener('blur', () => checkDataPath(true));
+dataPathInput.addEventListener('change', () => checkDataPath(true));
 </script>
 </body>
 </html>
