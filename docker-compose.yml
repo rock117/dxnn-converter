@@ -1,0 +1,16 @@
+services:
+  converter:
+    build: .
+    ports:
+      - "8899:8899"
+    volumes:
+      # Persist work files (uploaded models, converted outputs)
+      - ./work:/app/work
+      - ./tasks:/app/tasks
+      - ./app.py:/app/app.py:ro
+      # 可在 .env 中配置宿主路径，容器内 /app/yolo 对应宿主机 YOLO_HOST_PATH
+      - ${YOLO_HOST_PATH}:/app/yolo
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8899", "--reload"]
+    restart: unless-stopped

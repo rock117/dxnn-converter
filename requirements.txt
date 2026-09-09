@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+aiofiles==24.1.0
+# ultralytics with DEEPX export support (installs dx_com Python package)
+# Requires x86-64 Linux; dx_com wheel comes from DEEPX SDK index
+ultralytics[export-deepx]>=8.4.0
+onnx==1.16.1
+onnxruntime>=1.16.0
+opencv-python-headless==4.10.0.84
+pillow>=9.0.0
+numpy<=1.26.4
